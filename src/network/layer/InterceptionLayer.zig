@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+const std = @import("std");
 const builtin = @import("builtin");
 const lp = @import("lightpanda");
 const log = lp.log;
@@ -30,6 +31,7 @@ const FulfilledResponse = @import("../../browser/HttpClient.zig").FulfilledRespo
 const Layer = @import("../../browser/HttpClient.zig").Layer;
 const Forward = @import("Forward.zig");
 const HeaderResult = @import("../../browser/HttpClient.zig").HeaderResult;
+const isRedirectStatus = @import("../../browser/HttpClient.zig").isRedirectStatus;
 
 const InterceptionLayer = @This();
 
@@ -229,9 +231,34 @@ pub fn fulfillRequest(
         log.debug(.http, "fulfill transfer", .{ .intercepted = self.intercepted });
     }
 
-    // Leave the parked state (accounting `intercepted` exactly once) and move to
-    // .completing BEFORE running the user callbacks.
+    // Leave the parked state, accounting `intercepted` exactly once. State
+    // returns to .created — valid for re-issuing the transfer (redirect, below)
+    // or completing it (the normal fulfill path further down).
     transfer.unpark();
+
+    // A fulfilled 3xx response carrying a Location is a redirect: follow it
+    // instead of committing the 3xx body as the document — mirroring how
+    // real-network 3xx responses are followed (Client.processOneMessage). The
+    // target is re-issued down the chain past interception (self.next), so like
+    // Chrome it goes to the network rather than being intercepted again.
+    if (isRedirectStatus(status)) {
+        if (findHeader(headers, "location")) |location| {
+            transfer.prepareFulfilledRedirect(status, headers, location) catch |err| {
+                transfer.abort(err);
+                return err;
+            };
+            // Re-enter the chain; mirror continueRequest's ownership contract.
+            self.next.request(transfer) catch |err| {
+                if (transfer.state == .created) {
+                    transfer.abort(err);
+                }
+                return err;
+            };
+            return;
+        }
+    }
+
+    // Not a redirect: deliver the synthesized response as the document.
     transfer.state = .completing;
     defer transfer.deinit();
 
@@ -247,6 +274,15 @@ pub fn fulfillRequest(
         }
         return err;
     };
+}
+
+fn findHeader(headers: []const http.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            return h.value;
+        }
+    }
+    return null;
 }
 
 fn fulfillInner(

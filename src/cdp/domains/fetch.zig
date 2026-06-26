@@ -481,3 +481,75 @@ fn idFromRequestId(request_id: []const u8) !u32 {
     }
     return std.fmt.parseInt(u32, request_id[4..], 10) catch return error.InvalidParams;
 }
+
+const testing = @import("../testing.zig");
+const js = @import("../../browser/js/js.zig");
+
+// Pump the loop until the in-flight navigation is paused for interception,
+// then fulfill it with `status` + a Location header and wait for the followed
+// navigation to settle. `ctx` is the TestContext (taken as anytype since the
+// type is file-private to the test harness).
+fn fulfillRedirect(ctx: anytype, bc: *CDP.BrowserContext, msg_id: usize, status: u16, location: []const u8) !void {
+    const frame_id = bc.page_handle.?.frame_id;
+    var runner = bc.session.runner(.{});
+    var pumped: usize = 0;
+    while (bc.intercept_state.empty() and pumped < 200) : (pumped += 1) {
+        runner.waitForFrameCDP(frame_id, 10, .done) catch {};
+    }
+
+    const pending = bc.intercept_state.pendingIntercepts();
+    try testing.expect(pending.len >= 1);
+    const intercept_id = id.toInterceptId(pending[0]);
+
+    try ctx.processMessage(.{
+        .id = msg_id,
+        .method = "Fetch.fulfillRequest",
+        .params = .{
+            .requestId = intercept_id[0..],
+            .responseCode = status,
+            .responseHeaders = .{
+                .{ .name = "Location", .value = location },
+            },
+        },
+    });
+    try testing.waitForPage(bc);
+}
+
+test "cdp.fetch: fulfillRequest follows a 3xx redirect" {
+    // A response synthesized via Fetch.fulfillRequest with a 3xx status and a
+    // Location header is a redirect: it must be followed, not committed as the
+    // document. Like Chrome (and Lightpanda's real-network redirect path), the
+    // target is fetched normally — here from the test server — not re-intercepted.
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    var bc = try ctx.loadBrowserContext(.{ .id = "BID-FF", .url = "hi.html", .target_id = "FID-00000000FF".* });
+
+    // Intercept every request at the Request stage (Playwright's default pattern).
+    try ctx.processMessage(.{ .id = 30, .method = "Fetch.enable" });
+
+    // 302 → /redirect-target: the synthesized 302 body must not be committed;
+    // the frame ends up at the Location target, showing its body.
+    {
+        try ctx.processMessage(.{ .id = 31, .method = "Page.navigate", .params = .{ .url = "http://127.0.0.1:9582/intercept-me" } });
+        try fulfillRedirect(&ctx, bc, 40, 302, "http://127.0.0.1:9582/redirect-target");
+
+        const frame = bc.mainFrame() orelse unreachable;
+        try testing.expectEqualSlices(u8, "http://127.0.0.1:9582/redirect-target", frame.url);
+
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        const v = try ls.local.exec("document.title === 'landed'", null);
+        try testing.expect(v.toBool());
+    }
+
+    // RFC 7231 §7.1.2: a Location with no fragment inherits the request's fragment.
+    {
+        try ctx.processMessage(.{ .id = 32, .method = "Page.navigate", .params = .{ .url = "http://127.0.0.1:9582/intercept-me#myfrag" } });
+        try fulfillRedirect(&ctx, bc, 41, 302, "http://127.0.0.1:9582/redirect-target");
+
+        const frame = bc.mainFrame() orelse unreachable;
+        try testing.expectEqualSlices(u8, "http://127.0.0.1:9582/redirect-target#myfrag", frame.url);
+    }
+}

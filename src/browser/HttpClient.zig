@@ -1048,7 +1048,7 @@ fn isTeardownMethod(method: []const u8) bool {
         std.mem.eql(u8, method, "Page.close");
 }
 
-fn isRedirectStatus(status: u16) bool {
+pub fn isRedirectStatus(status: u16) bool {
     return switch (status) {
         301, 302, 303, 307, 308 => true,
         else => false,
@@ -1986,6 +1986,62 @@ pub const Transfer = struct {
         // 301, 302, 303 → change to GET, drop body.
         // 307, 308 → keep method and body.
         const status = try conn.getResponseCode();
+        if (status == 301 or status == 302 or status == 303) {
+            req.method = .GET;
+            req.body = null;
+        }
+    }
+
+    // Follow a redirect delivered through CDP Fetch.fulfillRequest. Mirrors
+    // handleRedirect, but the status, headers and base URL come from the
+    // synthesized (fulfilled) response rather than a libcurl connection. The
+    // caller re-issues the transfer down the chain after this returns.
+    pub fn prepareFulfilledRedirect(
+        transfer: *Transfer,
+        status: u16,
+        headers: []const http.Header,
+        location: []const u8,
+    ) !void {
+        const req = &transfer.req;
+        const arena = transfer.arena;
+
+        transfer._redirect_count += 1;
+        if (transfer._redirect_count > transfer.client.network.config.httpMaxRedirects()) {
+            return error.TooManyRedirects;
+        }
+
+        // retrieve cookies from the redirect's response. req.url is still the
+        // URL that produced this redirect (updated below).
+        if (req.cookie_jar) |jar| {
+            for (headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "set-cookie")) {
+                    try jar.populateFromResponse(req.url, h.value);
+                }
+            }
+        }
+
+        // resolve the redirect target against the current request URL.
+        const url: [:0]const u8 = blk: {
+            if (location.len == 0) {
+                break :blk "";
+            }
+
+            // req.url has transfer-arena lifetime; resolved is duped into it.
+            const resolved = try URL.resolve(arena, req.url, location, .{ .always_dupe = true });
+
+            // RFC 7231 §7.1.2: a Location with no fragment inherits the
+            // fragment of the request URL (see handleRedirect for the why).
+            if (URL.getHash(resolved).len == 0) {
+                const original_hash = URL.getHash(req.url);
+                if (original_hash.len != 0) {
+                    break :blk try std.mem.joinZ(arena, "", &.{ resolved, original_hash });
+                }
+            }
+            break :blk resolved;
+        };
+
+        try transfer.updateURL(url);
+        // 301, 302, 303 → change to GET, drop body. 307, 308 → keep both.
         if (status == 301 or status == 302 or status == 303) {
             req.method = .GET;
             req.body = null;
