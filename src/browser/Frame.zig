@@ -655,13 +655,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
             .timestamp = timestamp(.monotonic),
         });
 
-        // Record telemetry for navigation
-        session.browser.app.telemetry.record(.{
-            .navigate = .{
-                .tls = false, // about:blank and blob: are not TLS
-                .proxy = session.browser.app.config.httpProxy() != null,
-            },
-        });
+        self.recordNavigateTelemetry(false);
 
         session.notification.dispatch(.frame_navigated, &.{
             .req_id = req_id,
@@ -741,10 +735,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
     });
 
     // Record telemetry for navigation
-    session.browser.app.telemetry.record(.{ .navigate = .{
-        .tls = std.ascii.startsWithIgnoreCase(self.url, "https://"),
-        .proxy = session.browser.app.config.httpProxy() != null,
-    } });
+    self.recordNavigateTelemetry(std.ascii.startsWithIgnoreCase(self.url, "https://"));
 
     session.navigation._current_navigation_kind = opts.kind;
 
@@ -768,6 +759,18 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
         log.err(.frame, "navigate request", .{ .url = self.url, .err = err, .type = self._type });
         return err;
     };
+}
+
+fn recordNavigateTelemetry(self: *Frame, tls: bool) void {
+    self._session.browser.app.telemetry.record(.{ .navigate = .{
+        .tls = tls,
+        .context = if (self.parent != null)
+            .iframe
+        else if (self.window._opener != null)
+            .popup
+        else
+            .page,
+    } });
 }
 
 // Navigation can happen in many places, such as executing a <script> tag or
