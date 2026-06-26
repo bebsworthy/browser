@@ -353,6 +353,14 @@ pub fn navigateInner(
         try frame.queueHashChange(old_url, new_url);
     }
 
+    // A same-document commit here (Navigation API navigate/traverse, or
+    // history.back/forward/go that stays within the document) changed frame.url
+    // without a reload — notify CDP. .reload always schedules a real navigation
+    // (frame_navigated fires for it), so it's excluded.
+    if (is_same_document and kind != .reload) {
+        frame.notifyNavigatedWithinDocument(.history_api);
+    }
+
     if (self._on_currententrychange) |cec| {
         // If we haven't navigated off, let us fire off an a currententrychange.
         const event = (try NavigationCurrentEntryChangeEvent.initTrusted(

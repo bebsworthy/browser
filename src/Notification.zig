@@ -76,6 +76,7 @@ const EventListeners = struct {
     frame_created: List = .{},
     frame_navigate: List = .{},
     frame_navigated: List = .{},
+    frame_navigated_within_document: List = .{},
     frame_navigate_failed: List = .{},
     frame_network_idle: List = .{},
     frame_network_almost_idle: List = .{},
@@ -105,6 +106,7 @@ const Events = union(enum) {
     frame_created: *Frame,
     frame_navigate: *const FrameNavigate,
     frame_navigated: *const FrameNavigated,
+    frame_navigated_within_document: *const FrameNavigatedWithinDocument,
     frame_navigate_failed: *const FrameNavigateFailed,
     frame_network_idle: *const FrameNetworkIdle,
     frame_network_almost_idle: *const FrameNetworkAlmostIdle,
@@ -153,6 +155,19 @@ pub const FrameNavigated = struct {
     timestamp: u64,
     url: [:0]const u8,
     opts: Frame.NavigatedOpts,
+};
+
+pub const NavigatedWithinDocumentType = enum { history_api, fragment, other };
+
+// A same-document navigation: the frame's URL changed without a document reload
+// — history.pushState/replaceState, fragment navigation (anchor / location.hash),
+// or same-document history traversal. CDP turns this into
+// Page.navigatedWithinDocument so drivers keep frame.url()/page.url() in sync.
+// Unlike .frame_navigated, no new document or execution context is created.
+pub const FrameNavigatedWithinDocument = struct {
+    frame_id: u32,
+    url: [:0]const u8,
+    navigation_type: NavigatedWithinDocumentType,
 };
 
 // A root navigation that failed before commit (DNS failure, connection

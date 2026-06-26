@@ -755,6 +755,27 @@ pub fn frameNavigated(arena: Allocator, bc: *CDP.BrowserContext, event: *const N
     try cdp.sendEvent("DOM.documentUpdated", null, .{ .session_id = session_id });
 }
 
+// A same-document navigation (history.pushState/replaceState, fragment change, or
+// same-document history traversal). The document and execution context are unchanged,
+// so — unlike frameNavigated — this only reports the new URL. Drivers use it to keep
+// frame.url()/page.url() current after a client-side route change.
+pub fn frameNavigatedWithinDocument(bc: *CDP.BrowserContext, event: *const Notification.FrameNavigatedWithinDocument) !void {
+    const session_id = bc.session_id orelse return;
+    var cdp = bc.cdp;
+
+    const navigation_type: []const u8 = switch (event.navigation_type) {
+        .history_api => "historyApi",
+        .fragment => "fragment",
+        .other => "other",
+    };
+
+    try cdp.sendEvent("Page.navigatedWithinDocument", .{
+        .frameId = &id.toFrameId(event.frame_id),
+        .url = event.url,
+        .navigationType = navigation_type,
+    }, .{ .session_id = session_id });
+}
+
 pub fn frameDOMContentLoaded(bc: anytype, event: *const Notification.FrameDOMContentLoaded) !void {
     const session_id = bc.session_id orelse return;
     const timestamp = event.timestamp;
@@ -1670,4 +1691,73 @@ test "cdp.frame: getNavigationHistory + navigateToHistoryEntry" {
         });
         try ctx.expectSentError(-31998, "InvalidParams", .{ .id = 42 });
     }
+}
+
+// Runs `src` in the main frame's JS context, discarding the result. The bound
+// history/location functions it invokes set frame.js.local for their own
+// duration, so same-document navigation works exactly as from page script.
+fn execMainFrame(bc: *CDP.BrowserContext, src: []const u8) !void {
+    const frame = bc.mainFrame() orelse unreachable;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.exec(src, null);
+}
+
+test "cdp.page: navigatedWithinDocument for pushState / replaceState / fragment" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    var bc = try ctx.loadBrowserContext(.{ .id = "BID-NWD", .url = "hi.html", .target_id = "FID-0000000NWD".* });
+
+    // history.pushState — same-document, even across a path change → historyApi.
+    try execMainFrame(bc, "history.pushState(null, '', '/b')");
+    try ctx.expectSentEvent("Page.navigatedWithinDocument", .{
+        .url = "http://127.0.0.1:9582/b",
+        .navigationType = "historyApi",
+    }, .{});
+
+    // history.replaceState → historyApi.
+    try execMainFrame(bc, "history.replaceState(null, '', '/c')");
+    try ctx.expectSentEvent("Page.navigatedWithinDocument", .{
+        .url = "http://127.0.0.1:9582/c",
+        .navigationType = "historyApi",
+    }, .{});
+
+    // Fragment navigation (location.hash) is async (scheduled) and routes through
+    // the Frame fragment short-circuit → fragment.
+    try execMainFrame(bc, "location.hash = '#frag'");
+    try ctx.expectSentEvent("Page.navigatedWithinDocument", .{
+        .url = "http://127.0.0.1:9582/c#frag",
+        .navigationType = "fragment",
+    }, .{});
+
+    // The in-page location reflects the change too.
+    const frame = bc.mainFrame() orelse unreachable;
+    try testing.expectEqualSlices(u8, "http://127.0.0.1:9582/c#frag", frame.url);
+}
+
+test "cdp.page: navigatedWithinDocument for same-document history traversal" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    var bc = try ctx.loadBrowserContext(.{ .id = "BID-NWT", .url = "hi.html", .target_id = "FID-0000000NWT".* });
+
+    // Build same-document history: hi.html → #a → #b (pushState pushes entries).
+    try execMainFrame(bc, "history.pushState(null, '', '#a')");
+    try execMainFrame(bc, "history.pushState(null, '', '#b')");
+
+    // Traverse back twice. The second back lands on the fragment-less initial URL,
+    // which no forward operation emitted as a within-document URL — so matching it
+    // unambiguously proves the traversal (navigateInner) path emits the event.
+    try execMainFrame(bc, "history.back()");
+    try execMainFrame(bc, "history.back()");
+
+    try ctx.expectSentEvent("Page.navigatedWithinDocument", .{
+        .url = "http://127.0.0.1:9582/src/browser/tests/hi.html",
+        .navigationType = "historyApi",
+    }, .{});
+
+    const frame = bc.mainFrame() orelse unreachable;
+    try testing.expectEqualSlices(u8, "http://127.0.0.1:9582/src/browser/tests/hi.html", frame.url);
 }

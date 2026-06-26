@@ -64,6 +64,7 @@ const slotting = @import("webapi/element/slotting.zig");
 const NavigationKind = @import("webapi/navigation/root.zig").NavigationKind;
 
 const HttpClient = @import("HttpClient.zig");
+const Notification = @import("../Notification.zig");
 const sys_url = @import("../sys/url.zig");
 
 const timestamp = @import("../datetime.zig").timestamp;
@@ -770,6 +771,20 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
     };
 }
 
+// Emit the same-document navigation notification (CDP Page.navigatedWithinDocument).
+// Same-document URL changes — history.pushState/replaceState, fragment navigation,
+// and same-document history traversal — update `url` in place without a reload, so
+// they never reach the .frame_navigated dispatch in navigate()/frameHeaderCallback.
+// CDP clients (Playwright/Puppeteer) rely on this event to keep frame.url()/page.url()
+// in sync after a client-side route change.
+pub fn notifyNavigatedWithinDocument(self: *Frame, navigation_type: Notification.NavigatedWithinDocumentType) void {
+    self._session.notification.dispatch(.frame_navigated_within_document, &.{
+        .frame_id = self._frame_id,
+        .url = self.url,
+        .navigation_type = navigation_type,
+    });
+}
+
 // Navigation can happen in many places, such as executing a <script> tag or
 // a JavaScript callback, a CDP command, etc...It's rarely safe to do immediately
 // as the caller almost certainly doesn't expect the frame to go away during the
@@ -844,6 +859,8 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: Allocator, request_url
         if (target.parent == null) {
             try session.navigation.updateEntries(target.url, opts.kind, target, true);
         }
+
+        target.notifyNavigatedWithinDocument(.fragment);
 
         try target.queueHashChange(old_url, target.url);
 
